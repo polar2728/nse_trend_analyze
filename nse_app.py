@@ -12,6 +12,8 @@ from datetime import datetime
 import time
 from scipy import stats
 import concurrent.futures
+import requests
+from io import StringIO
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -52,11 +54,15 @@ def simplify_company_name(name):
 def fetch_nse_universe():
     """Fetch all NSE stocks"""
     try:
-        # Try with headers to avoid blocking
+        # Fetch with headers to avoid blocking
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        df = pd.read_csv(NSE_URL, headers=headers)
+        response = requests.get(NSE_URL, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        # Parse CSV
+        df = pd.read_csv(StringIO(response.text))
         df.columns = df.columns.str.strip()
         
         # Filter for equity series
@@ -71,7 +77,7 @@ def fetch_nse_universe():
         return df[['TICKER', 'SYMBOL', 'COMPANY_NAME', 'SEARCH_TERM']].copy()
     except Exception as e:
         st.error(f"Error fetching NSE universe: {e}")
-        st.info("Tip: Try again in a few seconds, or use a VPN if the issue persists")
+        st.info("💡 Tip: Click 'Use Sample Stocks' button instead to get started immediately!")
         return None
 
 
