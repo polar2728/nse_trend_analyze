@@ -1,6 +1,6 @@
 """
 NSE Google Trends Analyzer - All-in-One Streamlit App
-Analyzes 2000+ NSE stocks with parallel processing
+Analyzes 2000+ NSE stocks with threaded processing
 """
 
 import streamlit as st
@@ -11,8 +11,7 @@ import yfinance as yf
 from datetime import datetime
 import time
 from scipy import stats
-from multiprocessing import Pool, cpu_count
-import requests
+import concurrent.futures
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -20,7 +19,7 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # ============================================================================
 
-NUM_WORKERS = max(1, cpu_count() - 1)  # Parallel workers
+MAX_WORKERS = 4  # Thread pool workers
 BATCH_SIZE = 50  # Stocks per batch
 NSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -49,10 +48,15 @@ def simplify_company_name(name):
     return name.strip()
 
 
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_nse_universe():
     """Fetch all NSE stocks"""
     try:
-        df = pd.read_csv(NSE_URL)
+        # Try with headers to avoid blocking
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        df = pd.read_csv(NSE_URL, headers=headers)
         df.columns = df.columns.str.strip()
         
         # Filter for equity series
@@ -67,6 +71,7 @@ def fetch_nse_universe():
         return df[['TICKER', 'SYMBOL', 'COMPANY_NAME', 'SEARCH_TERM']].copy()
     except Exception as e:
         st.error(f"Error fetching NSE universe: {e}")
+        st.info("Tip: Try again in a few seconds, or use a VPN if the issue persists")
         return None
 
 
@@ -98,7 +103,7 @@ def analyze_single_stock(args):
         price_slope_norm = (price_slope / recent.iloc[0]) * 100
         
         # Get Google Trends data
-        time.sleep(2)  # Rate limiting
+        time.sleep(1.5)  # Rate limiting
         pytrends = TrendReq(hl='en-US', tz=360)
         
         try:
@@ -169,20 +174,27 @@ def analyze_single_stock(args):
         return None
 
 
-def analyze_batch_parallel(stocks_df, num_workers=None):
-    """Analyze stocks in parallel"""
-    if num_workers is None:
-        num_workers = NUM_WORKERS
-    
-    # Prepare work items
+def analyze_batch(stocks_df, max_workers=4, progress_callback=None):
+    """Analyze stocks using thread pool"""
     work_items = [(row['TICKER'], row['SEARCH_TERM']) for _, row in stocks_df.iterrows()]
     
-    # Process in parallel
     results = []
-    with Pool(processes=num_workers) as pool:
-        for result in pool.imap(analyze_single_stock, work_items):
+    completed = 0
+    
+    # Use ThreadPoolExecutor instead of multiprocessing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_stock = {executor.submit(analyze_single_stock, item): item for item in work_items}
+        
+        # Process as they complete
+        for future in concurrent.futures.as_completed(future_to_stock):
+            result = future.result()
             if result:
                 results.append(result)
+            
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(work_items))
     
     return pd.DataFrame(results)
 
@@ -214,19 +226,19 @@ def main():
     }
     max_stocks = stock_limits[analysis_mode]
     
-    num_workers = st.sidebar.slider(
-        "Parallel Workers",
+    max_workers = st.sidebar.slider(
+        "Concurrent Threads",
         min_value=1,
-        max_value=cpu_count(),
-        value=max(1, cpu_count() - 1),
-        help=f"Your system has {cpu_count()} CPU cores"
+        max_value=8,
+        value=4,
+        help="More threads = faster (but may hit API limits)"
     )
     
     st.sidebar.info(f"""
-    **System Info:**
-    - CPU Cores: {cpu_count()}
-    - Workers: {num_workers}
-    - Expected Speedup: ~{num_workers}x
+    **About Threading:**
+    - Uses {max_workers} concurrent threads
+    - Recommended: 3-5 threads
+    - Higher may cause API errors
     """)
     
     # Main area
@@ -239,20 +251,47 @@ def main():
     # Step 1: Fetch Universe
     st.header("Step 1: Fetch NSE Universe")
     
-    col1, col2 = st.columns([1, 3])
+    col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
         if st.button("🔄 Fetch NSE Stocks", type="primary"):
             with st.spinner("Fetching NSE stock universe..."):
-                universe = fetch_nse_universe()
-                if universe is not None:
-                    st.session_state.universe = universe
-                    st.success(f"✓ Fetched {len(universe)} stocks!")
-                else:
-                    st.error("Failed to fetch universe")
+                try:
+                    universe = fetch_nse_universe()
+                    if universe is not None and len(universe) > 0:
+                        st.session_state.universe = universe
+                        st.success(f"✓ Fetched {len(universe)} stocks!")
+                    else:
+                        st.error("Failed to fetch universe - got empty data")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    
+    with col2:
+        if st.button("🚀 Use Sample Stocks"):
+            # Sample Nifty 50 stocks as fallback
+            sample_data = {
+                'TICKER': ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'ICICIBANK.NS',
+                          'HINDUNILVR.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'KOTAKBANK.NS',
+                          'LT.NS', 'AXISBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS', 'TITAN.NS',
+                          'SUNPHARMA.NS', 'ULTRACEMCO.NS', 'WIPRO.NS', 'NESTLEIND.NS', 'BAJFINANCE.NS'],
+                'SYMBOL': ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK',
+                          'HINDUNILVR', 'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK',
+                          'LT', 'AXISBANK', 'ASIANPAINT', 'MARUTI', 'TITAN',
+                          'SUNPHARMA', 'ULTRACEMCO', 'WIPRO', 'NESTLEIND', 'BAJFINANCE'],
+                'COMPANY_NAME': ['Reliance Industries', 'TCS', 'HDFC Bank', 'Infosys', 'ICICI Bank',
+                                'Hindustan Unilever', 'ITC', 'SBI', 'Bharti Airtel', 'Kotak Bank',
+                                'Larsen & Toubro', 'Axis Bank', 'Asian Paints', 'Maruti', 'Titan',
+                                'Sun Pharma', 'UltraTech', 'Wipro', 'Nestle', 'Bajaj Finance'],
+                'SEARCH_TERM': ['Reliance', 'TCS', 'HDFC Bank', 'Infosys', 'ICICI Bank',
+                               'Hindustan Unilever', 'ITC', 'SBI', 'Airtel', 'Kotak',
+                               'Larsen Toubro', 'Axis Bank', 'Asian Paints', 'Maruti', 'Titan',
+                               'Sun Pharma', 'UltraTech', 'Wipro', 'Nestle', 'Bajaj Finance']
+            }
+            st.session_state.universe = pd.DataFrame(sample_data)
+            st.success("✓ Loaded 20 sample stocks (top Nifty stocks)")
     
     if st.session_state.universe is not None:
-        with col2:
+        with col3:
             st.metric("Total NSE Stocks", len(st.session_state.universe))
         
         # Show sample
@@ -268,8 +307,8 @@ def main():
         st.info(f"""
         **Selected:** {analysis_mode}
         - Stocks to analyze: {stocks_to_analyze}
-        - Workers: {num_workers}
-        - Estimated time: {stocks_to_analyze * 3 / num_workers / 60:.0f}-{stocks_to_analyze * 5 / num_workers / 60:.0f} minutes
+        - Threads: {max_workers}
+        - Estimated time: {stocks_to_analyze * 2 / max_workers / 60:.0f}-{stocks_to_analyze * 3 / max_workers / 60:.0f} minutes
         """)
         
         if st.button("▶️ Start Analysis", type="primary"):
@@ -279,6 +318,7 @@ def main():
             # Progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
+            results_text = st.empty()
             
             start_time = time.time()
             
@@ -291,17 +331,27 @@ def main():
                 batch_end = min(batch_start + BATCH_SIZE, len(stocks))
                 batch = stocks.iloc[batch_start:batch_end]
                 
-                status_text.text(f"Processing batch {batch_num + 1}/{total_batches} ({batch_start + 1}-{batch_end} of {len(stocks)})")
+                status_text.text(f"📊 Processing batch {batch_num + 1}/{total_batches} ({batch_start + 1}-{batch_end} of {len(stocks)})")
+                
+                # Progress callback for within-batch updates
+                def update_progress(completed, total):
+                    overall_completed = batch_start + completed
+                    overall_progress = overall_completed / len(stocks)
+                    progress_bar.progress(min(overall_progress, 1.0))
+                    results_text.text(f"✓ Analyzed: {overall_completed}/{len(stocks)} stocks")
                 
                 # Analyze batch
-                batch_results = analyze_batch_parallel(batch, num_workers)
-                
-                if not batch_results.empty:
-                    all_results.append(batch_results)
+                try:
+                    batch_results = analyze_batch(batch, max_workers, update_progress)
+                    
+                    if not batch_results.empty:
+                        all_results.append(batch_results)
+                except Exception as e:
+                    st.error(f"Error in batch {batch_num + 1}: {e}")
                 
                 # Update progress
-                progress = (batch_end) / len(stocks)
-                progress_bar.progress(progress)
+                progress = batch_end / len(stocks)
+                progress_bar.progress(min(progress, 1.0))
             
             # Combine results
             if all_results:
@@ -310,14 +360,18 @@ def main():
                 
                 elapsed = time.time() - start_time
                 
+                status_text.empty()
+                results_text.empty()
+                
                 st.success(f"""
-                ✓ Analysis Complete!
+                ✅ Analysis Complete!
                 - Stocks analyzed: {len(results_df)}
+                - Successful: {len(results_df[results_df['Status'] == 'Complete'])}
                 - Time taken: {elapsed/60:.1f} minutes
                 - Speed: {len(results_df) / elapsed * 60:.1f} stocks/minute
                 """)
             else:
-                st.error("No results generated")
+                st.error("No results generated - all stocks failed")
     
     # Step 3: View Results
     if st.session_state.results is not None:
